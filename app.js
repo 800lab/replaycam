@@ -1,6 +1,6 @@
-import { FrameBuffer, PlanarFrame, capturePlan, captureJpeg } from './frame-buffer.mjs?v=0.5.5';
-import { chooseCodec, videoProfiles, frameByteLimit, EncodedFrame, CodecPainter } from './video-codec.mjs?v=0.5.5';
-import { createVideoFile, canRecordVideo, recordVideoFile } from './video-file.mjs?v=0.5.5';
+import { FrameBuffer, PlanarFrame, capturePlan, captureJpeg } from './frame-buffer.mjs?v=0.5.6';
+import { chooseCodec, videoProfiles, frameByteLimit, EncodedFrame, CodecPainter } from './video-codec.mjs?v=0.5.6';
+import { createVideoFile, canRecordVideo, recordVideoFile } from './video-file.mjs?v=0.5.6';
 
 const $ = id => document.getElementById(id);
 const ui = Object.fromEntries(['app','source','display','empty','empty-text','view-state','status','start','pause','watch','again','switch','fullscreen','end','review-controls','seek','clip-time','quality','seconds','viewer','mirror','mode-hint','delay-name','slow-name','viewport','save-open','save-panel','mark-start','mark-end','trim-range','trim-preview','save-normal','save-slow','save-close','save-direction'].map(id => [id, $(id)]));
@@ -21,11 +21,11 @@ const codecPainter=new CodecPainter(ctx,codecFailure), downloads=new Map(), code
 let codecUnavailable=false;
 let editing=false;
 let exportJob=null;
-let preparedDownload=null,jpegBusy=false,jpegEpoch=0;
+let preparedDownload=null,sharingToken=null,jpegBusy=false,jpegEpoch=0;
 function codecFor(quality){if(codecUnavailable||preferJpeg)return Promise.resolve(null);if(!codecSupport.has(quality))codecSupport.set(quality,chooseCodec(videoProfiles[quality]));return codecSupport.get(quality);}
 function captureByteLimit(config){return config.format==='jpeg'?Math.floor(MAX_IMAGE_BYTES*.98/(Math.ceil(60.8*config.fps)+2)):frameByteLimit(config.fps);}
 async function refreshCodecOptions(){const quality=ui.quality.value,info=await codecFor(quality);if(quality!==ui.quality.value)return;const supported=(!!info&&!codecUnavailable)||jpegCapture;for(const option of ui.seconds.options)if(Number(option.value)>15)option.disabled=!supported;if(!supported&&seconds()>15)ui.seconds.value='10';}
-function clearDownloads(){for(const [url,timer]of downloads){clearTimeout(timer);URL.revokeObjectURL(url);}downloads.clear();preparedDownload=null;}
+function clearDownloads(){for(const [url,timer]of downloads){clearTimeout(timer);URL.revokeObjectURL(url);}downloads.clear();preparedDownload=null;sharingToken=null;}
 
 function message(text, error = false) {
   ui.status.textContent = text;
@@ -222,12 +222,14 @@ function compatibilityPlan(){
   return capturePlan(profile,seconds(),MAX_IMAGE_BYTES,seconds()*(mode==='delay'?2:1));
 }
 async function startCamera(deviceId = '') {
+  // A second start event must not cancel a pending permission request.
+  if(phase==='starting')return;
   if (!isSecureContext || !navigator.mediaDevices?.getUserMedia) {
     stop('HTTPSのURLで開いてください。',true); return;
   }
   if ((!planarCapture && !window.createImageBitmap) || !ctx) { fail({name:'NotSupportedError'}); return; }
   stop(); const ticket = generation;
-  phase='starting';overlay('カメラの許可を確認中');renderControls();
+  phase='starting';overlay('カメラを起動中');renderControls();
   const cameraOwner={disposed:false,stream:null,cameraRequest:null};session=cameraOwner;
   cameraOwner.permissionTimer=setTimeout(()=>{if(session===cameraOwner)stop('開始を中断しました。カメラの許可を確認してください。',true);},20000);
   try{
@@ -244,7 +246,7 @@ async function startCamera(deviceId = '') {
   const config=info?{...profile,format:'video',maxAgeMs:(history+.8)*1000,maxFrames:Math.ceil((history+.8)*profile.fps)+2}:compatibilityPlan();
   const scratch = document.createElement('canvas'); scratch.width = config.width; scratch.height = config.height;
   const s = {
-    config, info, encoder:null, quantizer:ui.quality.value==='light'?20:24,encodeRetries:0,smallFrames:0,byteLimit:captureByteLimit(config),scratch, ctx:scratch.getContext('2d',{alpha:false,willReadFrequently:config.format==='I420'||config.format==='RGBA'}), stream,cameraRequest:cameraOwner.cameraRequest, disposed:false,pipelineReady:false,
+    config, quality:ui.quality.value, info, encoder:null, quantizer:ui.quality.value==='light'?20:24,encodeRetries:0,smallFrames:0,byteLimit:captureByteLimit(config),scratch, ctx:scratch.getContext('2d',{alpha:false,willReadFrequently:config.format==='I420'||config.format==='RGBA'}), stream,cameraRequest:cameraOwner.cameraRequest, disposed:false,pipelineReady:false,
     buffer:new FrameBuffer({maxFrames:config.maxFrames,maxBytes:MAX_IMAGE_BYTES,maxAgeMs:config.maxAgeMs}),
     pending:false, nextCapture:0, lastMedia:-1, lastVideo:performance.now(), sampleTime:performance.now(),
     sampleFrames:0, fps:0, ready:false, reviewReady:false, lastDisplayed:null, lastPaint:performance.now(), performanceWarned:false,lastImage:performance.now(),
@@ -468,6 +470,8 @@ for(const button of document.querySelectorAll('button[data-mode]'))button.addEve
 });
 ui.seconds.addEventListener('change',changeView);
 ui.quality.addEventListener('change',()=>{
+  // Ignore a repeated select change with the same value (including restoration).
+  if(session?.quality===ui.quality.value||phase==='starting')return;
   refreshCodecOptions();
   if(phase==='live')startCamera(selectedDevice);
   else stop();
@@ -494,8 +498,25 @@ function updateTrim(){
   ui['save-slow'].textContent=convert&&!preparedMatches(.5)?'スローを作る（0.5倍）':'スローを保存（0.5倍）';
 }
 function preparedMatches(rate){return preparedDownload&&preparedDownload.owner===review&&preparedDownload.rate===rate&&preparedDownload.start===review.markStart&&preparedDownload.end===review.markEnd;}
+function photoSaveAvailable(file){
+  const ios=/iPhone|iPad|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+  if(!ios||!file||file.type!=='video/mp4'||!navigator.share||!navigator.canShare)return false;
+  try{return navigator.canShare({files:[file]});}catch{return false;}
+}
 function downloadPrepared(){
-  const link=document.createElement('a');link.href=preparedDownload.url;link.download=preparedDownload.name;
+  const prepared=preparedDownload;
+  if(!prepared.shareFailed&&photoSaveAvailable(prepared.file)){
+    const token=prepared.token;sharingToken=token;
+    // Call during this fresh tap, before any await; the OS chooses the destination.
+    message('メニューの「ビデオを保存」で写真に保存');
+    try{navigator.share({files:[prepared.file]}).catch(error=>{
+      if(preparedDownload?.token!==token)return;
+      if(error.name==='AbortError')message('');
+      else{preparedDownload.shareFailed=true;message('写真の保存メニューを開けません。もう一度「保存」でファイルに保存します。',true);}
+    }).finally(()=>{if(sharingToken===token)sharingToken=null;});}catch{sharingToken=null;prepared.shareFailed=true;message('写真の保存メニューを開けません。もう一度「保存」でファイルに保存します。',true);}
+    return;
+  }
+  const link=document.createElement('a');link.href=prepared.url;link.download=prepared.name;
   document.body.append(link);link.click();link.remove();message('保存先を確認してください。');
 }
 function setEditing(value){
@@ -522,7 +543,7 @@ ui['trim-preview'].addEventListener('click',()=>{
   updateReviewRetention();drawReview();renderControls();
 });
 async function saveVideo(rate){
-  if(!review||!editing||exportJob)return;
+  if(!review||!editing||exportJob||sharingToken)return;
   review.playing=false;updateReviewRetention();renderControls();
   if(preparedMatches(rate)){downloadPrepared();return;}
   clearDownloads();renderControls();
@@ -539,8 +560,9 @@ async function saveVideo(rate){
     }
     clearDownloads();
     const url=URL.createObjectURL(file.blob);
-    preparedDownload={url,owner,rate,start:owner.markStart,end:owner.markEnd,name:`replaycam${rate===.5?'-slow':''}-${new Date().toISOString().replace(/[:.]/g,'-')}.${file.extension}`};
-    downloads.set(url,setTimeout(()=>{URL.revokeObjectURL(url);downloads.delete(url);if(preparedDownload?.url===url){preparedDownload=null;renderControls();}},60000));
+    const name=`replaycam${rate===.5?'-slow':''}-${new Date().toISOString().replace(/[:.]/g,'-')}.${file.extension}`;
+    preparedDownload={token:Symbol(),url,owner,rate,start:owner.markStart,end:owner.markEnd,name,file:new File([file.blob],name,{type:file.blob.type.split(';')[0]})};
+    downloads.set(url,setTimeout(()=>{URL.revokeObjectURL(url);downloads.delete(url);if(preparedDownload?.url===url){preparedDownload=null;sharingToken=null;renderControls();}},60000));
     // A completed asynchronous conversion gets a fresh, explicit user tap.
     // Do not rely on the gesture from before several seconds of encoding.
     if(job)message(rate===.5?'できました。「スローを保存」を押してください。':'できました。「動画を保存」を押してください。');
@@ -583,7 +605,7 @@ document.addEventListener('keydown',event=>{
   if(event.key==='Escape' && editing){event.preventDefault();setEditing(false);return;}
   if(event.key==='Escape' && ui.viewer.classList.contains('expanded')){ui.viewer.classList.remove('expanded');syncExpanded();ui.fullscreen.focus();}
 });
-document.addEventListener('visibilitychange',()=>{if(document.hidden && phase!=='idle')stop();});
+document.addEventListener('visibilitychange',()=>{if(document.hidden && phase!=='idle' && !(phase==='review'&&sharingToken&&preparedDownload?.token===sharingToken))stop();});
 window.addEventListener('pagehide',()=>stop());document.addEventListener('freeze',()=>stop());
 window.addEventListener('resize',scheduleLayout);
 if(window.ResizeObserver){
