@@ -42,13 +42,15 @@ export class CodecPainter {
     const info=frame.image.info;
     if(this.info!==info){this.clear();this.info=info;}
     const epoch=this.epoch;
-    if(!this.decoder){
-      this.decoder=new VideoDecoder({output:image=>this.output(image,epoch),error:error=>{if(epoch===this.epoch)this.onError(error);}});
-      this.decoder.configure({...info.decoderConfig,optimizeForLatency:true});
+    try{
+      if(!this.decoder){
+        this.decoder=new VideoDecoder({output:image=>this.output(image,epoch),error:error=>{if(epoch===this.epoch)this.onError(error);}});
+        this.decoder.configure({...info.decoderConfig,optimizeForLatency:true});
+      }
+      this.job={frame,mirror,onPaint,isCurrent};
+      this.decoder.decode(new EncodedVideoChunk({type:frame.image.type,timestamp:frame.image.timestamp,data:frame.image.data}));
     }
-    this.job={frame,mirror,onPaint,isCurrent};
-    try{this.decoder.decode(new EncodedVideoChunk({type:frame.image.type,timestamp:frame.image.timestamp,data:frame.image.data}));}
-    catch(error){this.job=null;this.onError(error);}
+    catch(error){this.job=null;this.onError(error);return false;}
     return true;
   }
   async output(image,epoch){

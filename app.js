@@ -1,6 +1,6 @@
-import { FrameBuffer, PlanarFrame, capturePlan } from './frame-buffer.mjs?v=0.5.2';
-import { chooseCodec, videoProfiles, frameByteLimit, EncodedFrame, CodecPainter } from './video-codec.mjs?v=0.5.2';
-import { createVideoFile } from './video-file.mjs?v=0.5.2';
+import { FrameBuffer, PlanarFrame, capturePlan } from './frame-buffer.mjs?v=0.5.3';
+import { chooseCodec, videoProfiles, frameByteLimit, EncodedFrame, CodecPainter } from './video-codec.mjs?v=0.5.3';
+import { createVideoFile } from './video-file.mjs?v=0.5.3';
 
 const $ = id => document.getElementById(id);
 const ui = Object.fromEntries(['app','source','display','empty','empty-text','view-state','status','start','pause','watch','again','switch','fullscreen','end','review-controls','seek','clip-time','quality','seconds','viewer','mirror','mode-hint','delay-name','slow-name','viewport','save-open','save-panel','mark-start','mark-end','trim-range','trim-preview','save-normal','save-slow','save-close','save-direction'].map(id => [id, $(id)]));
@@ -11,12 +11,13 @@ const ctx = ui.display.getContext('2d', {alpha:false,willReadFrequently:true});
 const planarCapture=typeof ArrayBuffer.prototype.transfer==='function';
 let mode = 'delay', phase = 'idle', generation = 0, session = null, review = null;
 const PLAYBACK_RATE = 0.5;
-let selectedDevice = '', devices = [], retainedTimer = 0, reviewRaf = 0, layoutRaf = 0;
+let selectedDevice = '', devices = [], retainedTimer = 0, reviewRaf = 0, layoutRaf = 0, compatibilityTimer = 0;
 let paintedFrame = null, paintedMirror = false, paintBuffer = null;
-const codecPainter=new CodecPainter(ctx,fail), downloads=new Map(), codecSupport=new Map();
+const codecPainter=new CodecPainter(ctx,codecFailure), downloads=new Map(), codecSupport=new Map();
+let codecUnavailable=false;
 let editing=false;
-function codecFor(quality){if(!codecSupport.has(quality))codecSupport.set(quality,chooseCodec(videoProfiles[quality]));return codecSupport.get(quality);}
-async function refreshCodecOptions(){const info=await codecFor(ui.quality.value);for(const option of ui.seconds.options)if(Number(option.value)>15)option.disabled=!info;if(!info&&seconds()>15)ui.seconds.value='10';}
+function codecFor(quality){if(codecUnavailable)return Promise.resolve(null);if(!codecSupport.has(quality))codecSupport.set(quality,chooseCodec(videoProfiles[quality]));return codecSupport.get(quality);}
+async function refreshCodecOptions(){const quality=ui.quality.value,info=await codecFor(quality);if(quality!==ui.quality.value)return;const supported=!!info&&!codecUnavailable;for(const option of ui.seconds.options)if(Number(option.value)>15)option.disabled=!supported;if(!supported&&seconds()>15)ui.seconds.value='10';}
 function clearDownloads(){for(const [url,timer]of downloads){clearTimeout(timer);URL.revokeObjectURL(url);}downloads.clear();}
 
 function message(text, error = false) {
@@ -56,7 +57,7 @@ function showFrame(frame,onPaint) {
       frame.image.copyRGBA(paintBuffer.data,mirror);ctx.putImageData(paintBuffer,0,0);
     }else paint(frame.image);
     paintedFrame=frame;paintedMirror=mirror;onPaint?.();
-  }catch(error){fail(error);}
+  }catch(error){if(frame.image.kind==='video')codecFailure(error);else fail(error);}
 }
 function blank() {
   ui.display.width = 480; ui.display.height = 270;
@@ -151,6 +152,7 @@ function disposeSession() {
   ui.source.pause(); ui.source.srcObject = null;
 }
 function stop(text = '', error = false) {
+  clearTimeout(compatibilityTimer);compatibilityTimer=0;
   generation++; disposeSession(); clearReview(); blank();
   phase = 'idle'; badge(); overlay();
   message(text,error); renderControls();syncExpanded();
@@ -165,7 +167,24 @@ function fail(error) {
     SecurityError:'カメラが制限されています。端末の管理担当者に確認してください。',
     NotSupportedError:'このブラウザーには対応していません。最新版のChromeを試してください。',
   };
-  stop(help[error?.name] || error?.userMessage || '映像処理を終了しました。画質を「低め」にして再開してください。',true);
+  stop(help[error?.name] || error?.userMessage || '映像処理を終了しました。ページを再読み込みして、もう一度はじめてください。',true);
+}
+function codecFailure(error,owner=session){
+  if(owner?.disposed)return;
+  if(!owner?.info&&review?.sequence.frames[0]?.image.kind!=='video'){fail(error);return;}
+  const restart=!!owner&&!owner.ready&&(phase==='starting'||phase==='live');
+  // Retry once using the existing pixel-buffer path. A late error while
+  // reviewing must never restart the camera without another user action.
+  codecUnavailable=true;codecSupport.clear();
+  stop(restart?'':'映像処理を切り替えました。「はじめる」から再開してください。',!restart);
+  const ticket=generation;
+  if(restart){
+    phase='starting';overlay('映像を準備中');renderControls();
+    compatibilityTimer=setTimeout(()=>{if(ticket===generation)stop('開始を中断しました。カメラの許可を確認してください。',true);},20000);
+  }
+  Promise.resolve(owner?.cameraRequest).then(()=>refreshCodecOptions()).then(()=>{
+    if(ticket!==generation)return;if(restart)startCamera(selectedDevice);else renderControls();
+  },error=>{if(ticket===generation)fail(error);});
 }
 async function startCamera(deviceId = '') {
   if (!isSecureContext || !navigator.mediaDevices?.getUserMedia) {
@@ -182,7 +201,7 @@ async function startCamera(deviceId = '') {
   const config=info?{...profile,format:'video',maxAgeMs:(history+.8)*1000,maxFrames:Math.ceil((history+.8)*profile.fps)+2}:capturePlan(profile,seconds(),MAX_IMAGE_BYTES,history);
   const scratch = document.createElement('canvas'); scratch.width = config.width; scratch.height = config.height;
   const s = {
-    config, info, encoder:null, quantizer:ui.quality.value==='light'?20:24,encodeRetries:0,smallFrames:0,byteLimit:frameByteLimit(config.fps),scratch, ctx:scratch.getContext('2d',{alpha:false,willReadFrequently:true}), stream:null, disposed:false,
+    config, info, encoder:null, quantizer:ui.quality.value==='light'?20:24,encodeRetries:0,smallFrames:0,byteLimit:frameByteLimit(config.fps),scratch, ctx:scratch.getContext('2d',{alpha:false,willReadFrequently:true}), stream:null, cameraRequest:null, disposed:false,
     buffer:new FrameBuffer({maxFrames:config.maxFrames,maxBytes:MAX_IMAGE_BYTES,maxAgeMs:config.maxAgeMs}),
     pending:false, nextCapture:0, lastMedia:-1, lastVideo:performance.now(), sampleTime:performance.now(),
     sampleFrames:0, fps:0, ready:false, reviewReady:false, lastDisplayed:null, lastPaint:performance.now(), performanceWarned:false,lastImage:performance.now(),
@@ -194,7 +213,7 @@ async function startCamera(deviceId = '') {
     if (session === s) stop('開始を中断しました。カメラの許可を確認してください。',true);
   },20000);
   try {
-    if(info){
+    if(info){try{
       s.encoder=new VideoEncoder({output:(chunk,metadata)=>{
         if(s.disposed||session!==s)return;
         if(metadata.decoderConfig)info.decoderConfig=metadata.decoderConfig;
@@ -208,10 +227,10 @@ async function startCamera(deviceId = '') {
         }
         s.buffer.push(new EncodedFrame(chunk,info),chunk.timestamp/1000);s.sampleFrames++;s.lastImage=performance.now();s.pending=false;
         if(info.quantizer){s.smallFrames=chunk.byteLength<s.byteLimit*.5?s.smallFrames+1:0;if(s.smallFrames>=config.fps*2){s.quantizer=Math.max(20,s.quantizer-1);s.smallFrames=0;}}
-      },error:error=>{if(!s.disposed&&session===s)fail(error);}});
+      },error:error=>{if(!s.disposed&&session===s)codecFailure(error,s);}});
       s.encoder.configure(info.config);
-    }
-    const stream = await navigator.mediaDevices.getUserMedia({audio:false,video:{width:{ideal:640,max:640},height:{ideal:360,max:480},frameRate:{ideal:config.fps,max:30},...(deviceId?{deviceId:{exact:deviceId}}:{facingMode:'environment'})}});
+    }catch(error){codecFailure(error,s);return;}}
+    const stream = await (s.cameraRequest=navigator.mediaDevices.getUserMedia({audio:false,video:{width:{ideal:640,max:640},height:{ideal:360,max:480},frameRate:{ideal:config.fps,max:30},...(deviceId?{deviceId:{exact:deviceId}}:{facingMode:'environment'})}}));
     if (ticket !== generation || s.disposed) { stream.getTracks().forEach(track=>track.stop()); return; }
     s.stream = stream; ui.source.srcObject = stream; await ui.source.play();
     if (ticket !== generation || s.disposed) return;
@@ -232,8 +251,8 @@ async function startCamera(deviceId = '') {
     s.watchdog = setInterval(()=>{
       if (session !== s) return;
       if (performance.now()-s.lastVideo > 5000) { stop('映像が止まりました。カメラの接続を確認してください。',true); return; }
-      if (performance.now()-s.lastImage > 5000) { stop('映像処理が停止しました。画質を「低め」にして再開してください。',true); return; }
-      if (performance.now()>s.displayDeadline) { stop('映像表示が停止しました。画質を「低め」にして再開してください。',true); return; }
+      if (performance.now()-s.lastImage > 5000) { if(s.info&&!s.ready)codecFailure(new Error('Encoder did not produce frames'),s);else stop('映像処理が停止しました。画質を「低め」にして再開してください。',true);return; }
+      if (performance.now()>s.displayDeadline) { if(s.info&&!s.ready)codecFailure(new Error('Decoder did not display frames'),s);else stop('映像表示が停止しました。画質を「低め」にして再開してください。',true);return; }
       if (performance.now()>s.bufferDeadline && !(mode==='delay' && planarCapture?s.reviewReady:s.ready)) { stop('必要な映像を保持できません。画質を「低め」にして再開してください。',true); return; }
       checkPerformance(s);
     },1000);
@@ -289,9 +308,9 @@ function captureLoop(s) {
 }
 function encodeCapture(s){
   if(s.disposed)return;
-  const frame=new VideoFrame(s.scratch,{timestamp:s.captureTimestamp});
-  try{s.encoder.encode(frame,{keyFrame:true,...(s.info.quantizer?{avc:{quantizer:s.quantizer}}:{})});}
-  catch(error){fail(error);}finally{frame.close();}
+  let frame;
+  try{frame=new VideoFrame(s.scratch,{timestamp:s.captureTimestamp});s.encoder.encode(frame,{keyFrame:true,...(s.info.quantizer?{avc:{quantizer:s.quantizer}}:{})});}
+  catch(error){codecFailure(error,s);}finally{frame?.close();}
 }
 function renderLoop(s) {
   if (s.disposed) return;
