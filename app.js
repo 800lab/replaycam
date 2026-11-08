@@ -1,6 +1,6 @@
-import { FrameBuffer, PlanarFrame, capturePlan, captureJpeg } from './frame-buffer.mjs?v=0.5.6';
-import { chooseCodec, videoProfiles, frameByteLimit, EncodedFrame, CodecPainter } from './video-codec.mjs?v=0.5.6';
-import { createVideoFile, canRecordVideo, recordVideoFile } from './video-file.mjs?v=0.5.6';
+import { FrameBuffer, PlanarFrame, capturePlan, captureJpeg } from './frame-buffer.mjs?v=0.5.7';
+import { chooseCodec, videoProfiles, frameByteLimit, EncodedFrame, CodecPainter } from './video-codec.mjs?v=0.5.7';
+import { createVideoFile, canRecordVideo, recordVideoFile } from './video-file.mjs?v=0.5.7';
 
 const $ = id => document.getElementById(id);
 const ui = Object.fromEntries(['app','source','display','empty','empty-text','view-state','status','start','pause','watch','again','switch','fullscreen','end','review-controls','seek','clip-time','quality','seconds','viewer','mirror','mode-hint','delay-name','slow-name','viewport','save-open','save-panel','mark-start','mark-end','trim-range','trim-preview','save-normal','save-slow','save-close','save-direction'].map(id => [id, $(id)]));
@@ -43,6 +43,9 @@ function badge(text = '') {
 }
 function seconds() { return Number(ui.seconds.value); }
 function paint(image) {
+  // Retained frames may straddle a quality change. Resize only when a decoded
+  // frame is ready, so the picture is never cleared while waiting for a camera.
+  if(ui.display.width!==image.width||ui.display.height!==image.height){ui.display.width=image.width;ui.display.height=image.height;}
   ctx.save();
   if (ui.mirror.checked) { ctx.translate(ui.display.width, 0); ctx.scale(-1, 1); }
   ctx.drawImage(image, 0, 0, ui.display.width, ui.display.height);
@@ -96,11 +99,11 @@ function renderControls() {
   ui.start.textContent = viewing ? (mode==='delay'?'もどる':'つぎへ') : phase === 'paused' ? '再開する' : phase === 'starting' ? 'カメラ確認中…' : 'はじめる';
   ui.watch.hidden = !live;
   ui.watch.disabled = mode==='delay' ? !session?.reviewReady : !session?.ready;
-  ui.watch.textContent = mode==='delay' ? (session?.reviewReady?'この動きをスロー':'スロー準備中') : `直前${seconds()}秒を見る`;
+  ui.watch.textContent = mode==='delay' ? (session?.reviewReady?'この動きをスロー':session?.displayPaused?'つづけてからスロー':'スロー準備中') : `直前${seconds()}秒を見る`;
   ui.again.hidden = !viewing || editing;
   ui.pause.hidden = !((live && mode === 'delay') || (viewing && (review.playing || review.position < review.rangeEnd)));
   ui.pause.disabled = live && !session?.ready;
-  ui.pause.textContent = viewing ? (review.playing ? 'とめる' : 'つづける') : 'とめる';
+  ui.pause.textContent = viewing ? (review.playing ? 'とめる' : 'つづける') : session?.displayPaused?'つづける':'とめる';
   ui['save-open'].hidden=!viewing||editing||(review?.sequence.frames[0]?.image.kind!=='video'&&!canRecordVideo());
   ui['save-panel'].hidden=!editing;ui.viewer.dataset.editing=String(editing);
   document.querySelector('.seek-label').firstChild.textContent=editing?'保存する区間 ':'見たいところへ ';
@@ -118,7 +121,7 @@ function renderControls() {
   for (const control of [ui.quality,ui.seconds,ui.mirror]) control.disabled = phase === 'starting'||!!exportJob;
   document.querySelectorAll('button[data-mode]').forEach(button => {button.setAttribute('aria-pressed',String(button.dataset.mode === mode));button.disabled=phase==='starting'||!!exportJob;});
   if(editing)updateTrim();
-  if (viewing) badge('見返し 0.5倍・カメラ停止');
+  if (viewing) badge(session?.stream?'見返し 0.5倍・撮影中':'見返し 0.5倍・カメラ停止');
   if (ui.viewer.contains(active) && (active.disabled || active.closest('[hidden]'))) {
     const next = editing ? ui.end : viewing ? (ui.pause.hidden?ui.again:ui.pause) : phase==='idle' || phase==='paused' ? ui.start : ui.end;
     next.focus({preventScroll:true});
@@ -148,6 +151,7 @@ function clearReview() {
   clearTimeout(retainedTimer); retainedTimer = 0;
   cancelAnimationFrame(reviewRaf); reviewRaf = 0;
   review?.sequence.clear(); review = null;
+  if(session?.buffer)session.buffer.maxBytes=MAX_IMAGE_BYTES;
   ui.seek.value = '0'; ui.seek.removeAttribute('aria-valuetext'); ui['clip-time'].textContent = '';
 }
 function updateReviewRetention() {
@@ -233,7 +237,7 @@ async function startCamera(deviceId = '') {
   const cameraOwner={disposed:false,stream:null,cameraRequest:null};session=cameraOwner;
   cameraOwner.permissionTimer=setTimeout(()=>{if(session===cameraOwner)stop('開始を中断しました。カメラの許可を確認してください。',true);},20000);
   try{
-  const cameraSize=ui.quality.value==='light'?{width:640,height:360}:{width:1280,height:720};
+  const cameraSize=preferJpeg?{width:1280,height:720}:ui.quality.value==='light'?{width:640,height:360}:{width:1280,height:720};
   const stream=await(cameraOwner.cameraRequest=navigator.mediaDevices.getUserMedia({audio:false,video:{width:{ideal:cameraSize.width,max:cameraSize.width},height:{ideal:cameraSize.height,max:cameraSize.height},frameRate:{ideal:preferJpeg?30:videoProfiles[ui.quality.value].fps,max:30},...(deviceId?{deviceId:{exact:deviceId}}:{facingMode:'environment'})}}));
   if(ticket!==generation||cameraOwner.disposed){stream.getTracks().forEach(track=>track.stop());return;}
   cameraOwner.stream=stream;ui.source.srcObject=stream;await ui.source.play();
@@ -246,7 +250,7 @@ async function startCamera(deviceId = '') {
   const config=info?{...profile,format:'video',maxAgeMs:(history+.8)*1000,maxFrames:Math.ceil((history+.8)*profile.fps)+2}:compatibilityPlan();
   const scratch = document.createElement('canvas'); scratch.width = config.width; scratch.height = config.height;
   const s = {
-    config, quality:ui.quality.value, info, encoder:null, quantizer:ui.quality.value==='light'?20:24,encodeRetries:0,smallFrames:0,byteLimit:captureByteLimit(config),scratch, ctx:scratch.getContext('2d',{alpha:false,willReadFrequently:config.format==='I420'||config.format==='RGBA'}), stream,cameraRequest:cameraOwner.cameraRequest, disposed:false,pipelineReady:false,
+    config, quality:ui.quality.value, nextQuality:null, displayPaused:false, info, encoder:null, quantizer:ui.quality.value==='light'?20:24,encodeRetries:0,smallFrames:0,byteLimit:captureByteLimit(config),scratch, ctx:scratch.getContext('2d',{alpha:false,willReadFrequently:config.format==='I420'||config.format==='RGBA'}), stream,cameraRequest:cameraOwner.cameraRequest, disposed:false,pipelineReady:false,
     buffer:new FrameBuffer({maxFrames:config.maxFrames,maxBytes:MAX_IMAGE_BYTES,maxAgeMs:config.maxAgeMs}),
     pending:false, nextCapture:0, lastMedia:-1, lastVideo:performance.now(), sampleTime:performance.now(),
     sampleFrames:0, fps:0, ready:false, reviewReady:false, lastDisplayed:null, lastPaint:performance.now(), performanceWarned:false,lastImage:performance.now(),
@@ -274,7 +278,7 @@ async function startCamera(deviceId = '') {
     }catch(error){codecFailure(error,s);if(s.disposed)return;}}
     selectedDevice = stream.getVideoTracks()[0]?.getSettings().deviceId || deviceId;
     stream.getVideoTracks().forEach(track=>track.addEventListener('ended',()=>{
-      if (session === s) stop('カメラの接続が切れました。接続を確認してください。',true);
+      if(session===s)captureFailure(s,'カメラの接続が切れました。接続を確認してください。');
     }));
     ui.display.width = s.config.width; ui.display.height = s.config.height;
     s.sampleTime = s.lastVideo = s.lastImage = s.lastFrameCallback = performance.now(); phase = 'live';
@@ -287,10 +291,10 @@ async function startCamera(deviceId = '') {
     if(s.info)s.warmupTimer=setTimeout(()=>{if(session===s&&s.info&&!s.pipelineReady)codecFailure(new Error('Native startup did not deliver a real frame'),s);},1000);
     s.watchdog = setInterval(()=>{
       if (session !== s) return;
-      if (performance.now()-s.lastVideo > 5000) { stop('映像が止まりました。カメラの接続を確認してください。',true); return; }
-      if (performance.now()-s.lastImage > 5000) { if(s.info&&!s.ready)codecFailure(new Error('Encoder did not produce frames'),s);else stop('映像処理が停止しました。画質を「低め」にして再開してください。',true);return; }
-      if (performance.now()>s.displayDeadline) { if(s.info&&!s.ready)codecFailure(new Error('Decoder did not display frames'),s);else stop('映像表示が停止しました。画質を「低め」にして再開してください。',true);return; }
-      if (performance.now()>s.bufferDeadline && !(mode==='delay'?s.reviewReady:s.ready)) { stop('必要な映像を保持できません。画質を「低め」にして再開してください。',true); return; }
+      if (performance.now()-s.lastVideo > 5000) { captureFailure(s,'映像が止まりました。カメラの接続を確認してください。'); return; }
+      if (performance.now()-s.lastImage > 5000) { if(s.info&&!s.ready)codecFailure(new Error('Encoder did not produce frames'),s);else captureFailure(s,'映像処理が停止しました。画質を「低め」にして再開してください。');return; }
+      if (phase==='live'&&!s.displayPaused&&performance.now()>s.displayDeadline) { if(s.info&&!s.ready)codecFailure(new Error('Decoder did not display frames'),s);else stop('映像表示が停止しました。画質を「低め」にして再開してください。',true);return; }
+      if (phase==='live'&&!s.displayPaused&&performance.now()>s.bufferDeadline && !(mode==='delay'?s.reviewReady:s.ready)) { stop('必要な映像を保持できません。画質を「低め」にして再開してください。',true); return; }
       checkPerformance(s);
     },1000);
     captureLoop(s); renderLoop(s); renderControls();
@@ -315,7 +319,9 @@ function captureLoop(s) {
     const mediaTime=ui.source.currentTime;
     if(mediaTime===s.lastMedia || !ui.source.videoWidth) return;
     s.lastMedia=mediaTime;s.lastVideo=now;
-    if(s.pending || now+3<s.nextCapture) return;
+    if(s.pending)return;
+    if(s.nextQuality)applyCaptureQuality(s);
+    if(now+3<s.nextCapture)return;
     s.nextCapture=Math.max(s.nextCapture+1000/s.config.fps,now);s.pending=true;
     try {
       const scale=Math.min(s.config.width/ui.source.videoWidth,s.config.height/ui.source.videoHeight);
@@ -326,10 +332,10 @@ function captureLoop(s) {
         s.captureTimestamp=Math.round(now*1000);s.encodeRetries=0;encodeCapture(s);return;
       }
       if(s.config.format==='jpeg'){
-        captureJpeg(s.scratch,s.byteLimit,ui.quality.value==='light'?.8:.88).then(image=>{
+        captureJpeg(s.scratch,s.byteLimit,s.quality==='light'?.8:.88).then(image=>{
           if(s.disposed||session!==s){image.close();return;}
           s.buffer.push(image,now);s.sampleFrames++;s.lastImage=performance.now();
-        }).catch(error=>{if(!s.disposed)fail(error);}).finally(()=>{s.pending=false;});return;
+        }).catch(error=>{if(!s.disposed)captureFailure(s,'映像処理が停止しました。画質を変更して再開してください。');}).finally(()=>{s.pending=false;});return;
       }
       if(s.config.format==='I420'){
         const pixels=s.ctx.getImageData(0,0,s.config.width,s.config.height).data;
@@ -338,10 +344,10 @@ function captureLoop(s) {
         s.buffer.push(image,Math.round(now*1000)/1000);s.sampleFrames++;s.lastImage=performance.now();s.pending=false;return;
       }
       createImageBitmap(s.scratch).then(image=>{
-        if(s.disposed || session!==s || phase!=='live'){image.close();return;}
+        if(s.disposed || session!==s || !['live','review'].includes(phase)){image.close();return;}
         s.buffer.push(image,now);s.sampleFrames++;s.lastImage=performance.now();
       }).catch(error=>{if(!s.disposed)fail(error);}).finally(()=>{s.pending=false;});
-    } catch(error){s.pending=false;fail(error);}
+    } catch(error){s.pending=false;captureFailure(s,'撮影映像を処理できません。もう一度はじめてください。');}
   };
   // Some camera/Chrome combinations advance currentTime without frame callbacks.
   // Reuse the existing render RAF only while callbacks are missing; the same
@@ -359,6 +365,11 @@ function renderLoop(s) {
   if (s.disposed) return;
   s.renderRaf=requestAnimationFrame(()=>renderLoop(s));
   const now=performance.now();s.captureIfStalled?.(now);s.buffer.prune(now);
+  if(phase==='review')return;
+  if(s.displayPaused){
+    if(s.reviewReady&&!s.buffer.frames.includes(s.lastDisplayed)){s.reviewReady=false;renderControls();}
+    return;
+  }
   if(!s.pipelineReady){
     const initial=s.buffer.frames.at(-1);
     if(initial)showFrame(initial,()=>{if(session===s){s.pipelineReady=true;clearTimeout(s.warmupTimer);s.displayDeadline=performance.now()+(mode==='delay'?seconds()*1000:0)+5000;}});
@@ -393,24 +404,53 @@ function checkPerformance(s) {
     if(s.fps<s.config.fps*0.65 && !s.performanceWarned){s.performanceWarned=true;message('動作が遅くなっています。画質を「低め」に変更してください。',true);}
   }
 }
+function captureFailure(s,text){
+  if(session!==s||s.disposed)return;
+  if(phase==='review'&&review){disposeSession();message('撮影を停止しました。見返しは続けられます。',true);renderControls();return;}
+  stop(text,true);
+}
+function applyCaptureQuality(s){
+  if(s.pending||s.disposed||session!==s||s.config.format!=='jpeg')return;
+  const config=compatibilityPlan(),age=Math.max(s.config.maxAgeMs,config.maxAgeMs);
+  config.maxAgeMs=age;config.maxFrames=Math.max(s.buffer.maxFrames,Math.ceil(age/1000*config.fps)+2);
+  s.config=config;s.buffer.maxAgeMs=age;s.buffer.maxFrames=config.maxFrames;
+  s.scratch.width=config.width;s.scratch.height=config.height;
+  s.byteLimit=captureByteLimit(config);s.quality=ui.quality.value;s.nextQuality=null;
+  s.sampleTime=performance.now();s.sampleFrames=0;s.performanceWarned=false;
+}
 function pauseLive() {
-  generation++;disposeSession();phase='paused';badge('静止画・カメラ停止');
-  message('');
-  retainedTimer=setTimeout(()=>stop('一時停止から60秒経過。映像を消去しました。'),RETAINED_IDLE_MS);
+  const s=session;if(!s?.ready)return;
+  s.displayPaused=true;resetPainting();badge('表示停止・撮影中');message('');
+  clearTimeout(retainedTimer);
+  retainedTimer=setTimeout(()=>stop('表示を止めてから60秒経過。終了しました。'),RETAINED_IDLE_MS);
   renderControls();
+}
+function resumeLive(){
+  const s=session;if(!s)return;
+  clearTimeout(retainedTimer);retainedTimer=0;s.displayPaused=false;
+  s.displayDeadline=performance.now()+5000;badge(`${seconds()}秒あと`);message('');renderControls();
+}
+function returnToCamera(){
+  if(phase==='review'&&session?.stream){
+    clearReview();phase='live';session.displayPaused=false;message('');changeView();syncExpanded();
+  }else startCamera(selectedDevice);
 }
 function watchRecent() {
   const s=session;
   if(phase!=='live' || !s?.ready || (mode==='delay' && !s.reviewReady))return;
   if(performance.now()-s.buffer.frames.at(-1).time>1000){stop('映像が届きません。カメラの接続を確認してください。',true);return;}
   const retained=s.info||s.config.format==='jpeg'?30:seconds();
-  const sequence=mode==='delay'?s.buffer.takeEndingAt(s.lastDisplayed.time,retained*1000):s.buffer.takeRecent(retained*1000);
+  const continuous=s.config.format==='jpeg';
+  const end=mode==='delay'?s.lastDisplayed.time:s.buffer.frames.at(-1).time;
+  const sequence=continuous?s.buffer.copyEndingAt(end,retained*1000):s.buffer.takeEndingAt(end,retained*1000);
   sequence.fps=s.config.fps;
   if(sequence.duration<300){sequence.clear();fail({userMessage:'映像が短すぎます。撮影を再開してください。'});return;}
-  generation++;disposeSession();clearReview();
+  if(!continuous){generation++;disposeSession();}
+  clearReview();
+  if(continuous){s.displayPaused=false;s.buffer.maxBytes=MAX_IMAGE_BYTES-sequence.bytes;s.buffer.prune(performance.now());}
   const rangeStart=Math.max(0,sequence.duration-seconds()*1000);
   review={sequence,rangeStart,rangeEnd:sequence.duration,normalStart:rangeStart,position:rangeStart,playing:true,lastNow:performance.now(),markStart:0,markEnd:sequence.duration};phase='review';
-  badge('見返し・カメラ停止');overlay();
+  overlay();
   message('');
   drawReview();renderControls();reviewLoop();
 }
@@ -434,19 +474,21 @@ function reviewLoop() {
   if(playing!==review.playing){updateReviewRetention();renderControls();}
   reviewRaf=requestAnimationFrame(reviewLoop);
 }
-ui.start.addEventListener('click',()=>startCamera(selectedDevice));
+ui.start.addEventListener('click',returnToCamera);
 ui.end.addEventListener('click',()=>stop());
 ui.watch.addEventListener('click',watchRecent);
 ui.again.addEventListener('click',()=>{if(review){review.position=review.rangeStart;review.playing=true;review.lastNow=performance.now();updateReviewRetention();drawReview();renderControls();}});
 ui.pause.addEventListener('click',()=>{
-  if(phase==='live')pauseLive();
+  if(phase==='live'){if(session?.displayPaused)resumeLive();else pauseLive();}
   else if(review){const playing=review.playing;advanceReview(performance.now());review.playing=!playing && review.position<review.rangeEnd;review.lastNow=performance.now();updateReviewRetention();drawReview();renderControls();}
 });
 ui.seek.addEventListener('input',()=>{if(review){review.stopAt=null;review.position=review.rangeStart+Number(ui.seek.value)/1000*(review.rangeEnd-review.rangeStart);review.playing=false;review.lastNow=performance.now();updateReviewRetention();drawReview();renderControls();}});
 ui.switch.addEventListener('click',()=>{if(devices.length>1)startCamera(devices[(devices.findIndex(device=>device.deviceId===selectedDevice)+1)%devices.length].deviceId);});
 function changeView(){
   if(phase==='live'&&session){
-    const s=session,compressed=s.info||s.config.format==='jpeg',history=compressed?(mode==='delay'?seconds()+30:30):seconds()*(mode==='delay'?2:1);
+    const s=session;
+    clearTimeout(retainedTimer);retainedTimer=0;s.displayPaused=false;
+    const compressed=s.info||s.config.format==='jpeg',history=compressed?(mode==='delay'?seconds()+30:30):seconds()*(mode==='delay'?2:1);
     const age=Math.max(s.config.maxAgeMs,(history+.8)*1000);
     const config=compressed?{...s.config,maxAgeMs:age,maxFrames:Math.ceil(age/1000*s.config.fps)+2}:capturePlan(s.config,seconds(),MAX_IMAGE_BYTES,age/1000-.8);
     Object.assign(s.config,config);
@@ -470,21 +512,23 @@ for(const button of document.querySelectorAll('button[data-mode]'))button.addEve
 });
 ui.seconds.addEventListener('change',changeView);
 ui.quality.addEventListener('change',()=>{
-  // Ignore a repeated select change with the same value (including restoration).
-  if(session?.quality===ui.quality.value||phase==='starting')return;
+  if(phase==='starting')return;
+  if(session?.quality===ui.quality.value){session.nextQuality=null;return;}
   refreshCodecOptions();
-  if(phase==='live')startCamera(selectedDevice);
-  else stop();
+  if(session?.config?.format==='jpeg'){
+    session.nextQuality=ui.quality.value;
+    if(!session.pending)applyCaptureQuality(session);
+  }else if(review||session)message('画質は次の撮影から反映します。');
 });
 ui.mirror.addEventListener('change',()=>{
   if(review){updateReviewRetention();drawReview();renderControls();}
-  else if(phase==='paused'){
+  else if(phase==='live'&&session?.displayPaused){
     const copy=document.createElement('canvas');copy.width=ui.display.width;copy.height=ui.display.height;
     const copyContext=copy.getContext('2d');
     if(!copyContext){fail({userMessage:'映像を反転できません。撮影を再開してください。'});return;}
     copyContext.drawImage(ui.display,0,0);
     ctx.save();ctx.translate(ui.display.width,0);ctx.scale(-1,1);ctx.drawImage(copy,0,0);ctx.restore();
-    copy.width=copy.height=1;badge('静止画・カメラ停止');
+    copy.width=copy.height=1;badge('表示停止・撮影中');
   }else if(phase==='live')badge(mode==='delay'?`${seconds()}秒あと`:'今の映像');
 });
 function updateTrim(){
@@ -605,7 +649,14 @@ document.addEventListener('keydown',event=>{
   if(event.key==='Escape' && editing){event.preventDefault();setEditing(false);return;}
   if(event.key==='Escape' && ui.viewer.classList.contains('expanded')){ui.viewer.classList.remove('expanded');syncExpanded();ui.fullscreen.focus();}
 });
-document.addEventListener('visibilitychange',()=>{if(document.hidden && phase!=='idle' && !(phase==='review'&&sharingToken&&preparedDownload?.token===sharingToken))stop();});
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden||phase==='idle')return;
+  if(phase==='review'&&sharingToken&&preparedDownload?.token===sharingToken){
+    // Keep only the bounded review/file for the OS menu; never a hidden camera.
+    disposeSession();renderControls();return;
+  }
+  stop();
+});
 window.addEventListener('pagehide',()=>stop());document.addEventListener('freeze',()=>stop());
 window.addEventListener('resize',scheduleLayout);
 if(window.ResizeObserver){

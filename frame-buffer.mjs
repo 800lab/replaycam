@@ -86,6 +86,19 @@ export class FrameBuffer {
   takeRecent(durationMs) {
     return this.takeEndingAt(this.frames.at(-1)?.time ?? 0,durationMs);
   }
+  // JPEG wrappers share immutable Blob storage; closing either owner must not
+  // clear the other. Callers budget both owners conservatively, even on overlap.
+  copyEndingAt(endTime,durationMs) {
+    if(!this.frames.length)return new FrameSequence([],0,0);
+    const end=Math.min(endTime,this.frames.at(-1).time);
+    if(end<this.frames[0].time)return new FrameSequence([],0,0);
+    const start=Math.max(this.frames[0].time,end-durationMs);
+    let first=0;
+    for(let i=0;i<this.frames.length;i++)if(this.frames[i].time<=start)first=i;
+    const selected=this.frames.slice(first).filter(frame=>frame.time<=end);
+    if(selected.some(frame=>frame.image.kind!=='jpeg'||!frame.image.blob))throw new Error('Only retained JPEG frames can be shared');
+    return new FrameSequence(selected.map(frame=>({...frame,image:new JpegFrame(frame.image.blob,frame.image.width,frame.image.height)})),start,end-start);
+  }
   takeEndingAt(endTime,durationMs) {
     const frames = this.frames;
     this.frames = []; this.bytes = 0;
