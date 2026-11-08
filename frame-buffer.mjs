@@ -9,6 +9,21 @@ export function capturePlan(profile, seconds, maxBytes, historySeconds = seconds
   return {...profile, fps, maxAgeMs, maxFrames:Math.ceil(maxAgeMs / 1000 * fps) + 2};
 }
 
+// Compressed still frames keep long histories without a WebCodecs dependency.
+// Only one encode/decode is in flight; discarded Blob references are released.
+export class JpegFrame {
+  constructor(blob,width,height){this.kind='jpeg';this.blob=blob;this.width=width;this.height=height;this.byteLength=blob.size;}
+  close(){this.blob=null;}
+}
+export async function captureJpeg(canvas,maxBytes,quality=.88){
+  for(let attempt=0;attempt<4;attempt++){
+    const level=attempt===3?.12:Math.max(.12,quality-attempt*.22);
+    const blob=await new Promise((resolve,reject)=>canvas.toBlob(blob=>blob?resolve(blob):reject(new Error('Image encoding failed')),'image/jpeg',level));
+    if(blob.size<=maxBytes)return new JpegFrame(blob,canvas.width,canvas.height);
+  }
+  throw new Error('Image exceeds frame budget');
+}
+
 // 8-bit luma at full resolution; chroma at half width/height, standard I420.
 // Own exact-sized byte arrays, with no codec or decoded-image cache behind them.
 export class PlanarFrame {

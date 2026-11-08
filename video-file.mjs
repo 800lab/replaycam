@@ -67,7 +67,7 @@ export function createVideoFile(sequence,startMs,endMs,rate=1){
 // user-selected, finite interval, after the camera has already been stopped.
 function recorderType(){
   if(typeof MediaRecorder!=='function'||typeof HTMLCanvasElement==='undefined'||typeof HTMLCanvasElement.prototype.captureStream!=='function')return null;
-  return ['video/mp4;codecs=avc1.42E01E','video/mp4','video/webm;codecs=vp8','video/webm'].find(type=>MediaRecorder.isTypeSupported?.(type))??(MediaRecorder.isTypeSupported?null:'');
+  return ['video/mp4;codecs=avc1.42E01F','video/mp4','video/webm;codecs=vp8','video/webm'].find(type=>MediaRecorder.isTypeSupported?.(type))??(MediaRecorder.isTypeSupported?null:'');
 }
 export function canRecordVideo(){return recorderType()!==null;}
 
@@ -86,24 +86,33 @@ export function recordVideoFile(sequence,startMs,endMs,rate=1,{signal,onProgress
       error?reject(error):resolve(file);
     };
     const abort=()=>finish(abortError());
-    try{
+    const initialize=async()=>{try{
       if(signal?.aborted)throw abortError();
       if(![1,.5].includes(rate)||!Number.isFinite(startMs)||!Number.isFinite(endMs)||startMs<0||endMs<=startMs||endMs>sequence.duration+.01||endMs-startMs>30000)throw new Error('Invalid selection');
       const type=recorderType(),first=sequence.at(startMs),last=sequence.at(endMs);
       if(type===null||!first||!last||first.image.kind==='video')throw new Error('Recording not supported');
-      const fps=Math.min(15,sequence.fps||15),duration=(last.time-first.time+1000/fps)/rate;
+      const fps=Math.min(30,sequence.fps||15),duration=(last.time-first.time+1000/fps)/rate;
       if(duration<=0||duration>61000)throw new Error('Invalid duration');
       canvas=document.createElement('canvas');canvas.width=first.image.width;canvas.height=first.image.height;
       const ctx=canvas.getContext('2d',{alpha:false});if(!ctx)throw new Error('Canvas unavailable');
-      const draw=position=>{
+      const draw=async position=>{
         const frame=sequence.at(position),image=frame?.image;if(!image)throw abortError();
-        if(image.data){pixels??=ctx.createImageData(image.width,image.height);image.copyRGBA(pixels.data);ctx.putImageData(pixels,0,0);}
+        if(image.kind==='jpeg'){
+          const bitmap=await createImageBitmap(image.blob);
+          try{if(settled||signal?.aborted)throw abortError();ctx.drawImage(bitmap,0,0);}finally{bitmap.close();}
+        }
+        else if(image.data){pixels??=ctx.createImageData(image.width,image.height);image.copyRGBA(pixels.data);ctx.putImageData(pixels,0,0);}
         else ctx.drawImage(image,0,0);
       };
-      draw(first.time-sequence.start);
+      signal?.addEventListener('abort',abort,{once:true});
+      deadline=setTimeout(()=>finish(new Error('Video recording timed out')),duration+10000);
+      await draw(first.time-sequence.start);
+      if(settled)return;
       stream=canvas.captureStream(fps);
       if(stream.getVideoTracks().length!==1||stream.getAudioTracks().length)throw new Error('Invalid export stream');
-      recorder=new MediaRecorder(stream,{...(type?{mimeType:type}:{}),videoBitsPerSecond:2500000});
+      const targetBitrate=canvas.width>=960?6000000:3000000;
+      const videoBitsPerSecond=Math.min(targetBitrate,Math.floor(32*1024*1024*.85*8/(duration/1000)));
+      recorder=new MediaRecorder(stream,{...(type?{mimeType:type}:{}),videoBitsPerSecond});
       const mime=recorder.mimeType||type,extension=mime.startsWith('video/mp4')?'mp4':mime.startsWith('video/webm')?'webm':null;
       if(!extension)throw new Error('Unsupported recording format');
       recorder.ondataavailable=event=>{
@@ -119,25 +128,24 @@ export function recordVideoFile(sequence,startMs,endMs,rate=1,{signal,onProgress
         if(!total){finish(new Error('Empty recording'));return;}
         finish(null,{blob:new Blob(chunks,{type:mime}),extension,duration:duration/1000,sourceStart:first.time,sourceEnd:last.time});
       };
-      signal?.addEventListener('abort',abort,{once:true});
       // Includes the stop/flush stage: a recorder that never fires onstop is
       // bounded too. All exit paths release its canvas, timers and tracks.
-      deadline=setTimeout(()=>finish(new Error('Video recording timed out')),duration+10000);
       recorder.start(250);
       const started=performance.now();let previous=started;
-      const step=()=>{
+      const step=async()=>{
         if(settled)return;
         try{
           const now=performance.now(),elapsed=now-started;
           if(now-previous>1500)throw new Error('Video recording stalled');
           previous=now;
-          draw(Math.min(last.time-sequence.start,first.time-sequence.start+elapsed*rate));
+          await draw(Math.min(last.time-sequence.start,first.time-sequence.start+elapsed*rate));
+          if(settled)return;
           onProgress(Math.min(elapsed,duration),duration);
           if(elapsed>=duration){completed=true;recorder.stop();return;}
-          timer=setTimeout(step,1000/fps);
+          timer=setTimeout(step,Math.max(0,1000/fps-(performance.now()-now)));
         }catch(error){finish(error);}
       };
       step();
-    }catch(error){finish(error);}
+    }catch(error){finish(error);}};initialize();
   });
 }
